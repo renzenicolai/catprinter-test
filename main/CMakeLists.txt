@@ -1,0 +1,14 @@
+idf_component_register(
+	SRCS
+		"main.c"
+		"ble_peer.c"
+	PRIV_REQUIRES
+		esp_lcd
+		fatfs
+		nvs_flash
+		bt
+		badge-bsp
+		tanmatsu-wifi
+	INCLUDE_DIRS
+		"."
+)
