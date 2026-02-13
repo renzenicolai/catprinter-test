@@ -1118,20 +1118,42 @@ void app_main(void) {
     // Start the GPIO interrupt service
     gpio_install_isr_service(0);
 
-    // Initialize the Non Volatile Storage service
+    // Initialize the Non Volatile Storage partition
     esp_err_t res = nvs_flash_init();
     if (res == ESP_ERR_NVS_NO_FREE_PAGES || res == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
+        res = nvs_flash_erase();
+        if (res != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to erase NVS flash: %d", res);
+            return;
+        }
         res = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(res);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize NVS flash: %d", res);
+        return;
+    }
 
     // Initialize the Board Support Package
-    ESP_ERROR_CHECK(bsp_device_initialize());
+    const bsp_configuration_t bsp_configuration = {
+        .display =
+            {
+                .requested_color_format = LCD_COLOR_PIXEL_FORMAT_RGB888,
+                .num_fbs                = 1,
+            },
+    };
+    res = bsp_device_initialize(&bsp_configuration);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize BSP: %d", res);
+        return;
+    }
 
     // Get display parameters and rotation
     res = bsp_display_get_parameters(&display_h_res, &display_v_res, &display_color_format, &display_data_endian);
-    ESP_ERROR_CHECK(res);  // Check that the display parameters have been initialized
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get display parameters: %d", res);
+        return;
+    }
+
     bsp_display_rotation_t display_rotation = bsp_display_get_default_rotation();
 
     // Convert ESP-IDF color format into PAX buffer type
@@ -1171,7 +1193,11 @@ void app_main(void) {
     pax_buf_set_orientation(&fb, orientation);
 
     // Get input event queue from BSP
-    ESP_ERROR_CHECK(bsp_input_get_queue(&input_event_queue));
+    res = bsp_input_get_queue(&input_event_queue);
+    if (res != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get input event queue: %d", res);
+        return;
+    }
 
     // Start WiFi stack (if your app does not require WiFi or BLE you can remove this section)
     pax_background(&fb, WHITE);
