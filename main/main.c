@@ -25,6 +25,7 @@
 #include "services/gap/ble_svc_gap.h"
 #include "wifi_connection.h"
 #include "wifi_remote.h"
+#include "esp_hosted.h"
 
 #define BLACK 0xFF000000
 #define WHITE 0xFFFFFFFF
@@ -55,7 +56,7 @@ static int  check_if_catprinter(const struct ble_gap_disc_desc* disc);
 static void connect_to_device(const ble_addr_t* addr);
 static int  blecent_subscribe(uint16_t conn_handle);
 
-int next_write(uint16_t conn_handle);
+static void write_task(void* arg);
 
 static void blit(void) {
     bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -120,7 +121,7 @@ void print_mbuf(const struct os_mbuf* om) {
 
 ////////
 
-uint32_t write_pos = 0;
+static uint16_t write_conn_handle = 0;
 
 static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
     struct ble_gap_conn_desc desc;
@@ -135,6 +136,8 @@ static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
             if (check_if_catprinter(&event->disc)) {
                 ESP_LOGI(TAG, "Found cat printer!  Connecting...");
                 connect_to_device(&event->disc.addr);
+            } else {
+                ESP_LOGI(TAG, "Found other BLE device.");
             }
             return 0;
         case BLE_GAP_EVENT_CONNECT:
@@ -160,13 +163,11 @@ static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
                 if (rc != 0) {
                     ESP_LOGE(TAG, "Failed to negotiate MTU; rc = %d", rc);
                 }
-                // Initiate security (to enable writing to characteristics that require encryption)
-                rc = ble_gap_security_initiate(event->connect.conn_handle);
+                // Perform service discovery
+                rc = peer_disc_all(event->connect.conn_handle, blecent_on_disc_complete, NULL);
                 if (rc != 0) {
-                    MODLOG_DFLT(INFO, "Security could not be initiated, rc = %d\n", rc);
-                    return ble_gap_terminate(event->connect.conn_handle, BLE_ERR_REM_USER_CONN_TERM);
-                } else {
-                    MODLOG_DFLT(INFO, "Connection secured\n");
+                    ESP_LOGE(TAG, "Failed to discover services; rc=%d\n", rc);
+                    return 0;
                 }
             } else {
                 // Connection attempt failed
@@ -184,17 +185,10 @@ static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
             ESP_LOGI(TAG, "Discovery complete; reason=%d\n", event->disc_complete.reason);
             return 0;
         case BLE_GAP_EVENT_ENC_CHANGE:
-            // Encryption has been enabled or disabled for this connection
             rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
             if (rc != 0) return rc;
             ESP_LOGI(TAG, "BLE encryption change event for device %s (status=%d)", addr_str(desc.peer_ota_addr.val),
                      event->enc_change.status);
-            // Perform service discovery
-            rc = peer_disc_all(event->connect.conn_handle, blecent_on_disc_complete, NULL);
-            if (rc != 0) {
-                ESP_LOGE(TAG, "Failed to discover services; rc=%d\n", rc);
-                return 0;
-            }
             return 0;
         case BLE_GAP_EVENT_NOTIFY_RX:
             // Peer sent us a notification or indication
@@ -247,14 +241,11 @@ static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
 
 static int blecent_on_subscribe(uint16_t conn_handle, const struct ble_gatt_error* error, struct ble_gatt_attr* attr,
                                 void* arg) {
-    ESP_LOGI(TAG,
-             "Subscribe complete; status=%d conn_handle=%d "
-             "attr_handle=%d\n",
+    ESP_LOGI(TAG, "Subscribe complete; status=%d conn_handle=%d attr_handle=%d\n",
              error->status, conn_handle, attr->handle);
 
-    // Start sending stream of commands
-    write_pos = 0;
-    next_write(conn_handle);  // Start writing commands
+    write_conn_handle = conn_handle;
+    xTaskCreate(write_task, "ble_write", 4096, NULL, 5, NULL);
 
     return 0;
 }
@@ -885,73 +876,51 @@ const uint8_t write_data[] = {
 
 uint8_t cmd_get_dev_state[] = {0x51, 0x78, 0xa3, 0x00, 0x01, 0x00, 0x00, 0x00, 0xff};
 
-static int blecent_on_write(uint16_t conn_handle, const struct ble_gatt_error* error, struct ble_gatt_attr* attr,
-                            void* arg) {
-    ESP_LOGI(TAG, "Write complete; status=0x%02x conn_handle=%d attr_handle=%d\n", error->status, conn_handle,
-             attr->handle);
-
-    if (error->status == BLE_HS_ATT_ERR(BLE_ATT_ERR_WRITE_NOT_PERMITTED)) {
-        ESP_LOGE(TAG, "Write not permitted");
+static void write_task(void* arg) {
+    uint16_t           conn_handle = write_conn_handle;
+    const struct peer* peer        = peer_find(conn_handle);
+    if (peer == NULL) {
+        ESP_LOGE(TAG, "Write task: no peer found");
+        vTaskDelete(NULL);
+        return;
     }
 
-    next_write(conn_handle);
-    return 0;
-}
-
-int next_write(uint16_t conn_handle) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-    const struct peer_chr* chr;
-    int                    rc;
-    const struct peer*     peer = peer_find(conn_handle);
-
-    chr = peer_chr_find_uuid(peer, BLE_UUID16_DECLARE(BLECENT_SVC_CATPRINTER_UUID),
-                             BLE_UUID16_DECLARE(BLECENT_CHR_TX_UUID));
+    const struct peer_chr* chr = peer_chr_find_uuid(peer, BLE_UUID16_DECLARE(BLECENT_SVC_CATPRINTER_UUID),
+                                                    BLE_UUID16_DECLARE(BLECENT_CHR_TX_UUID));
     if (chr == NULL) {
-        ESP_LOGE(TAG, "Error: Peer doesn't support the TX characteristic\n");
-        goto err;
+        ESP_LOGE(TAG, "Write task: TX characteristic not found");
+        vTaskDelete(NULL);
+        return;
     }
 
-    if (peer->mtu == 0) {
-        ESP_LOGE(TAG, "Can't send, MTU unknown");
-        return 0;
+    uint8_t  max_chunk = ((peer->mtu > 3) ? peer->mtu : 23) - 3;
+    uint32_t pos       = 0;
+
+    while (pos < sizeof(write_data)) {
+        uint8_t length = max_chunk;
+        if (pos + length > sizeof(write_data)) {
+            length = sizeof(write_data) - pos;
+        }
+
+        int rc = ble_gattc_write_no_rsp_flat(conn_handle, chr->chr.val_handle, &write_data[pos], length);
+        if (rc == BLE_HS_ENOMEM) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if (rc != 0) {
+            ESP_LOGE(TAG, "Write failed at pos=%" PRIu32 " rc=%d", pos, rc);
+            break;
+        }
+
+        ESP_LOGI(TAG, "Wrote %d bytes (pos=%" PRIu32 ")", length, pos);
+        pos += length;
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    if (peer->mtu <= 3) {
-        ESP_LOGE(TAG, "Can't send, MTU too small");
-        return 0;
+    if (pos >= sizeof(write_data)) {
+        ESP_LOGI(TAG, "All data written (%d bytes)", (int)sizeof(write_data));
     }
-
-    uint8_t length = peer->mtu - 3;
-
-    if (write_pos + length > sizeof(write_data)) {
-        length = sizeof(write_data) - write_pos;
-    }
-
-    if (length == 0) {
-        ESP_LOGI(TAG, "All data written");
-        write_pos = 0;
-        return 0;
-    }
-
-    ESP_LOGI(TAG, "Writing %d bytes (pos = %" PRIu32 ")...", length, write_pos);
-
-    for (uint8_t i = 0; i < length; i++) {
-        printf("%02x ", write_data[write_pos + i]);
-    }
-    printf("\r\n");
-
-    rc = ble_gattc_write_flat(conn_handle, chr->chr.val_handle, &write_data[write_pos], length, blecent_on_write, NULL);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "Error: Failed to write characteristic; rc=%d\n", rc);
-        goto err;
-    }
-
-    write_pos += length;
-
-    return 0;
-err:
-    /* Terminate the connection. */
-    return ble_gap_terminate(peer->conn_handle, BLE_ERR_REM_USER_CONN_TERM);
+    vTaskDelete(NULL);
 }
 
 static void blecent_on_disc_complete(const struct peer* peer, int status, void* arg) {
@@ -1209,6 +1178,17 @@ void app_main(void) {
         pax_draw_text(&fb, WHITE, pax_font_sky_mono, 16, 0, 0, "Radio unavailable");
         blit();
         return;
+    }
+
+    wifi_connection_init_stack();
+
+    if (ESP_OK != esp_hosted_bt_controller_init()) {
+        ESP_LOGW("INFO", "failed to init bt controller");
+    }
+
+    // enable bt controller
+    if (ESP_OK != esp_hosted_bt_controller_enable()) {
+        ESP_LOGW("INFO", "failed to enable bt controller");
     }
 
     res = nimble_port_init();
