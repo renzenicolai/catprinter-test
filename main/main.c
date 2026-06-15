@@ -785,7 +785,7 @@ void app_main(void) {
         pax_simple_rect(&printer_fb, BLACK, 140, y, 104, 3.5f);
     }
 
-    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_marker, 48, 0, 0, "Hello world!");
+    pax_draw_text(&printer_fb, 0xFFFFFFFF, pax_font_marker, 48, 0, 0, "Hello world!");
     
 
     // Main section of the app
