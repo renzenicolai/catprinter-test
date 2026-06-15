@@ -121,7 +121,11 @@ void print_mbuf(const struct os_mbuf* om) {
 
 ////////
 
-static uint16_t write_conn_handle = 0;
+static uint16_t          write_conn_handle = 0;
+static volatile bool     printer_ready     = false;
+
+typedef enum { PAPER_UNKNOWN, PAPER_INSERTED, PAPER_EMPTY } paper_status_t;
+static volatile paper_status_t paper_status = PAPER_UNKNOWN;
 
 static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
     struct ble_gap_conn_desc desc;
@@ -213,6 +217,11 @@ static int blecent_gap_event(struct ble_gap_event* event, void* arg) {
             }
             printf("\n");
 
+            // Parse device state response (cmd 0xa3): payload[0]=1 → paper in, 0 → no paper
+            if (notif_len >= 9 && notif_data[0] == 0x51 && notif_data[1] == 0x78 && notif_data[2] == 0xa3) {
+                paper_status = notif_data[6] ? PAPER_EMPTY : PAPER_INSERTED;
+            }
+
             return 0;
         case BLE_GAP_EVENT_MTU:
             ESP_LOGI(TAG, "mtu update event; conn_handle=%d cid=%d mtu=%d\n", event->mtu.conn_handle,
@@ -245,7 +254,7 @@ static int blecent_on_subscribe(uint16_t conn_handle, const struct ble_gatt_erro
              error->status, conn_handle, attr->handle);
 
     write_conn_handle = conn_handle;
-    xTaskCreate(write_task, "ble_write", 4096, NULL, 5, NULL);
+    printer_ready     = true;
 
     return 0;
 }
@@ -443,7 +452,13 @@ static void write_task(void* arg) {
     write_set_energy(conn_handle, val_handle, 0xffff);
     write_set_print_mode(conn_handle, val_handle, 0x01);
     write_lattice_start(conn_handle, val_handle);
+    int last_row = 0;
     for (int row = 0; row < 256; row++) {
+        for (int col = 0; col < 48; col++) {
+            if (image_data[row][col]) { last_row = row; break; }
+        }
+    }
+    for (int row = 0; row <= last_row; row++) {
         uint8_t rle_buf[128];
         uint8_t rle_len = rle_encode_line(image_data[row], rle_buf);
         write_print_rle_line(conn_handle, val_handle, rle_buf, rle_len);
@@ -785,96 +800,69 @@ void app_main(void) {
         pax_simple_rect(&printer_fb, BLACK, 140, y, 104, 3.5f);
     }
 
-    pax_draw_text(&printer_fb, 0xFFFFFFFF, pax_font_marker, 48, 0, 0, "Hello world!");
-    
+    // Text input state
+    char input_buf[256] = {0};
+    int  input_len      = 0;
 
-    // Main section of the app
-
-    // This example shows how to read from the BSP event queue to read input events
-
-    // If you want to run something at an interval in this same main thread you can replace portMAX_DELAY with an amount
-    // of ticks to wait, for example pdMS_TO_TICKS(1000)
-
+    // Initial UI draw
     pax_background(&fb, WHITE);
-    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Welcome! Press any key to trigger an event.");
+    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 18, 4, 4,  "Cat Printer");
+    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 14, 4, 28, "Connecting to printer...");
+    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 14, 4, 56, "Type text, press ENTER to print:");
+    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 14, 4, 76, "> _");
     blit();
-    
 
     while (1) {
         bsp_input_event_t event;
-        if (xQueueReceive(input_event_queue, &event, portMAX_DELAY) == pdTRUE) {
-            switch (event.type) {
-                case INPUT_EVENT_TYPE_KEYBOARD: {
-                    if (event.args_keyboard.ascii != '\b' ||
-                        event.args_keyboard.ascii != '\t') {  // Ignore backspace & tab keyboard events
-                        ESP_LOGI(TAG, "Keyboard event %c (%02x) %s", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii, event.args_keyboard.utf8);
-                        pax_simple_rect(&fb, WHITE, 0, 0, pax_buf_get_width(&fb), 72);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 0, "Keyboard event");
-                        char text[64];
-                        snprintf(text, sizeof(text), "ASCII:     %c (0x%02x)", event.args_keyboard.ascii,
-                                 (uint8_t)event.args_keyboard.ascii);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 18, text);
-                        snprintf(text, sizeof(text), "UTF-8:     %s", event.args_keyboard.utf8);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 36, text);
-                        snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_keyboard.modifiers);
-                        pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 54, text);
-                        blit();
-                    }
-                    break;
-                }
-                case INPUT_EVENT_TYPE_NAVIGATION: {
-                    ESP_LOGI(TAG, "Navigation event %0" PRIX32 ": %s", (uint32_t)event.args_navigation.key,
-                             event.args_navigation.state ? "pressed" : "released");
+        bool redraw = (xQueueReceive(input_event_queue, &event, pdMS_TO_TICKS(500)) != pdTRUE);
 
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1) {
-                        bsp_device_restart_to_launcher();
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F2) {
-                        bsp_input_set_backlight_brightness(0);
-                    }
-                    if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F3) {
-                        bsp_input_set_backlight_brightness(100);
-                    }
-
-                    pax_simple_rect(&fb, WHITE, 0, 100, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 0, "Navigation event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Key:       0x%0" PRIX32, (uint32_t)event.args_navigation.key);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 18, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_navigation.state ? "pressed" : "released");
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 36, text);
-                    snprintf(text, sizeof(text), "Modifiers: 0x%0" PRIX32, event.args_navigation.modifiers);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 100 + 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_ACTION: {
-                    ESP_LOGI(TAG, "Action event 0x%0" PRIX32 ": %s", (uint32_t)event.args_action.type,
-                             event.args_action.state ? "yes" : "no");
-                    pax_simple_rect(&fb, WHITE, 0, 200 + 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 0, "Action event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Type:      0x%0" PRIX32, (uint32_t)event.args_action.type);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 36, text);
-                    snprintf(text, sizeof(text), "State:     %s", event.args_action.state ? "yes" : "no");
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 200 + 54, text);
-                    blit();
-                    break;
-                }
-                case INPUT_EVENT_TYPE_SCANCODE: {
-                    ESP_LOGI(TAG, "Scancode event 0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    pax_simple_rect(&fb, WHITE, 0, 300 + 0, pax_buf_get_width(&fb), 72);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 300 + 0, "Scancode event");
-                    char text[64];
-                    snprintf(text, sizeof(text), "Scancode:  0x%0" PRIX32, (uint32_t)event.args_scancode.scancode);
-                    pax_draw_text(&fb, BLACK, pax_font_sky_mono, 16, 0, 300 + 36, text);
-                    blit();
-                    break;
-                }
-                default:
-                    break;
+        if (!redraw && event.type == INPUT_EVENT_TYPE_KEYBOARD) {
+            char c = event.args_keyboard.ascii;
+            if (c == '\b' && input_len > 0) {
+                input_buf[--input_len] = '\0';
+                redraw = true;
+            } else if (c >= 0x20 && c <= 0x7e && input_len < 255) {
+                input_buf[input_len++] = c;
+                input_buf[input_len]   = '\0';
+                redraw = true;
             }
+        } else if (!redraw && event.type == INPUT_EVENT_TYPE_NAVIGATION) {
+            if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_RETURN && event.args_navigation.state
+                && input_len > 0) {
+                // Render input text onto printer buffer and send
+                pax_background(&printer_fb, WHITE);
+                pax_draw_text(&printer_fb, BLACK, pax_font_sky_mono, 24, 4, 4, input_buf);
+                if (printer_ready) {
+                    xTaskCreate(write_task, "ble_write", 4096, NULL, 5, NULL);
+                }
+                input_buf[0] = '\0';
+                input_len    = 0;
+                redraw       = true;
+            } else if (event.args_navigation.key == BSP_INPUT_NAVIGATION_KEY_F1 && event.args_navigation.state) {
+                bsp_device_restart_to_launcher();
+            }
+        }
+
+        if (redraw) {
+            char status_line[64];
+            if (!printer_ready) {
+                snprintf(status_line, sizeof(status_line), "Printer: connecting...");
+            } else if (paper_status == PAPER_INSERTED) {
+                snprintf(status_line, sizeof(status_line), "Printer: ready");
+            } else if (paper_status == PAPER_EMPTY) {
+                snprintf(status_line, sizeof(status_line), "Printer: out of paper");
+            } else {
+                snprintf(status_line, sizeof(status_line), "Printer: ready");
+            }
+            char input_line[260];
+            snprintf(input_line, sizeof(input_line), "> %s_", input_buf);
+
+            pax_background(&fb, WHITE);
+            pax_draw_text(&fb, BLACK, pax_font_sky_mono, 18, 4, 4,  "Cat Printer");
+            pax_draw_text(&fb, BLACK, pax_font_sky_mono, 14, 4, 28, status_line);
+            pax_draw_text(&fb, BLACK, pax_font_sky_mono, 14, 4, 56, "Type text, press ENTER to print:");
+            pax_draw_text(&fb, BLACK, pax_font_sky_mono, 14, 4, 76, input_line);
+            blit();
         }
     }
 }
