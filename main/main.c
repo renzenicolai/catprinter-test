@@ -443,7 +443,7 @@ static void write_task(void* arg) {
     write_set_energy(conn_handle, val_handle, 0xffff);
     write_set_print_mode(conn_handle, val_handle, 0x01);
     write_lattice_start(conn_handle, val_handle);
-    for (int row = 0; row < 48; row++) {
+    for (int row = 0; row < 256; row++) {
         uint8_t rle_buf[128];
         uint8_t rle_len = rle_encode_line(image_data[row], rle_buf);
         write_print_rle_line(conn_handle, val_handle, rle_buf, rle_len);
@@ -758,10 +758,34 @@ void app_main(void) {
     }
 #endif
 
-    pax_buf_t fb = {0};
-    pax_buf_init(&fb, (uint8_t*)image_data, 48*8, 256, PAX_BUF_1_GREY);
-    pax_background(&fb, 0xFFFFFFFF);
-    pax_draw_text(&fb, 0xFF000000, pax_font_marker, 48, 0, 0, "Hello world!");
+    pax_buf_t printer_fb = {0};
+    pax_buf_init(&printer_fb, (uint8_t*)image_data, 48*8, 256, PAX_BUF_1_GREY);
+    // Synthwave scene: black sky, striped sun on horizon, perspective grid floor
+    pax_background(&printer_fb, BLACK);
+
+    // Grid floor: radiating lines from vanishing point (192, 128)
+    for (int i = 0; i <= 12; i++) {
+        float x = i * (384.0f / 12.0f);
+        pax_simple_line(&printer_fb, WHITE, 192, 128, x, 255);
+    }
+    // Horizontal floor lines with quadratic (perspective) spacing
+    for (int i = 1; i <= 6; i++) {
+        float t = (float)i / 7.0f;
+        float y = 128.0f + (256.0f - 128.0f) * t * t;
+        pax_simple_line(&printer_fb, WHITE, 0, y, 383, y);
+    }
+    // Horizon line
+    pax_simple_line(&printer_fb, WHITE, 0, 128, 383, 128);
+
+    // Sun: white circle sitting on horizon, drawn over grid
+    pax_simple_circle(&printer_fb, WHITE, 192, 90, 50);
+    // Horizontal stripe bands through lower sun (synthwave style)
+    for (int i = 0; i < 7; i++) {
+        float y = 95.0f + i * 7.0f;
+        pax_simple_rect(&printer_fb, BLACK, 140, y, 104, 3.5f);
+    }
+
+    pax_draw_text(&fb, 0xFFFFFFFF, pax_font_marker, 48, 0, 0, "Hello world!");
     
 
     // Main section of the app
